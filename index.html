@@ -94,6 +94,9 @@
         <div class="toolbar" style="margin-top:10px">
           <button class="btn" id="saveBtn">데이터 저장</button>
           <button class="btn-muted" id="clearBtn">입력 초기화</button>
+          <button class="btn-ghost" id="downloadRecords">데이터 다운로드</button>
+          <button class="btn-muted" id="uploadRecordsBtn">데이터 업로드</button>
+          <input type="file" id="uploadRecordsInput" accept="application/json" style="display:none">
           <span class="pill">
             <span>중재 시작 회기</span>
             <input id="interventionStart" type="number" min="1" value="4" style="width:80px;padding:6px 10px">
@@ -141,6 +144,9 @@
         <div class="toolbar" style="margin-top:10px">
           <button class="btn" id="regBtn">학생 등록</button>
           <button class="btn-muted" id="resetLocal">로컬 데이터 초기화</button>
+          <button class="btn-ghost" id="downloadStudents">학생 다운로드</button>
+          <button class="btn-muted" id="uploadStudentsBtn">학생 업로드</button>
+          <input type="file" id="uploadStudentsInput" accept="application/json" style="display:none">
         </div>
         <div id="regMsg" class="msg hidden"></div>
       </section>
@@ -152,10 +158,14 @@
           <label>Google Sheet URL</label><input id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/d/...">
         </div>
         <div class="toolbar" style="margin-top:10px">
-          <button class="btn" id="saveUrl">시트 URL 저장</button>
+          <button class="btn" id="connectSheet">연결</button>
+          <button class="btn-muted" id="disconnectSheet">연결 해제</button>
+          <button class="btn-ghost" id="downloadSheetTemplate">헤더 양식 다운로드</button>
           <button class="btn-ghost" id="pullAll">서버 → 로컬 동기화</button>
+          <span class="pill" id="sheetStatus"><span class="muted">연결되지 않음</span></span>
         </div>
-        <div class="note" style="margin-top:8px">관리자는 전체 데이터를 확인하고 동기화할 수 있습니다.</div>
+        <div id="sheetMsg" class="msg hidden"></div>
+        <div class="note" style="margin-top:8px">관리자는 전체 데이터를 확인하고 동기화할 수 있습니다. (헤더 양식을 구글시트 첫 행에 붙여넣으세요)</div>
       </section>
     </div>
   </div>
@@ -195,12 +205,101 @@ const WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxCHjjR08I0sH_N0PiHp
 let students = [];
 let dataMap = {};
 let me = { role: null, cls: null };
+let sheetState = { url: "", connected: false, connectedAt: null };
 
 // ====== 유틸리티 함수들 ======
 function q(sel) { return document.querySelector(sel); }
 function qa(sel) { return Array.from(document.querySelectorAll(sel)); }
 function today() { return new Date().toISOString().split("T")[0]; }
 function uuid() { return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+function safeFileName(name) {
+  return (name || "export").replace(/[\\/:*?"<>|]+/g, "_");
+}
+
+function downloadJson(data, filename) {
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 0);
+  } catch (e) {
+    console.error('다운로드 생성 실패:', e);
+  }
+}
+
+function downloadText(content, filename, mime = "text/plain") {
+  try {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 0);
+  } catch (e) {
+    console.error('텍스트 다운로드 실패:', e);
+  }
+}
+
+function normalizeDate(value) {
+  if (value === null || typeof value === "undefined") return "";
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const base = new Date(Date.UTC(1899, 11, 30));
+    const excelDate = new Date(base.getTime() + Math.round(value) * 86400000);
+    if (!isNaN(excelDate)) {
+      return excelDate.toISOString().split("T")[0];
+    }
+  }
+  const str = String(value).trim();
+  if (!str) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+  const normalized = str.replace(/[.]/g, "-").replace(/\//g, "-");
+  const date = new Date(normalized);
+  if (!isNaN(date)) {
+    return date.toISOString().split("T")[0];
+  }
+  return "";
+}
+
+function parseScore(value) {
+  if (value === null || typeof value === "undefined" || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.round(num);
+  return Math.max(0, Math.min(5, rounded));
+}
+
+function normalizeRecords(records = []) {
+  const sanitized = [];
+  records.forEach((raw, idx) => {
+    if (!raw) return;
+    const date = normalizeDate(raw.date ?? raw.sessionDate ?? raw.day ?? raw.recordedAt);
+    const inc = parseScore(raw.inc ?? raw.incScore ?? raw.increase ?? raw.incBehavior ?? raw.inc_value);
+    const dec = parseScore(raw.dec ?? raw.decScore ?? raw.decrease ?? raw.decBehavior ?? raw.dec_value);
+    if (!date || inc === null || dec === null) return;
+    const memoSource = raw.memo ?? raw.note ?? raw.notes ?? raw.comment ?? "";
+    const memo = memoSource === null || typeof memoSource === "undefined" ? "" : String(memoSource);
+    let timestamp = Number(raw.timestamp);
+    if (!Number.isFinite(timestamp)) timestamp = Date.now() + idx;
+    let id = typeof raw.id === "string" && raw.id ? raw.id : "";
+    if (!id) id = uuid();
+    sanitized.push({ id, date, inc, dec, memo, timestamp });
+  });
+  sanitized.sort((a, b) => a.date.localeCompare(b.date) || a.timestamp - b.timestamp);
+  return sanitized;
+}
 
 function showMsg(elId, text, ok = true) {
   const el = typeof elId === 'string' ? document.getElementById(elId) : elId;
@@ -216,6 +315,7 @@ function persist() {
     localStorage.setItem("ibrst_students", JSON.stringify(students));
     localStorage.setItem("ibrst_data", JSON.stringify(dataMap));
     localStorage.setItem("ibrst_me", JSON.stringify(me));
+    localStorage.setItem("ibrst_sheet_state", JSON.stringify(sheetState));
   } catch (e) {
     console.error('데이터 저장 실패:', e);
   }
@@ -226,11 +326,22 @@ function restore() {
     students = JSON.parse(localStorage.getItem("ibrst_students") || "[]");
     dataMap = JSON.parse(localStorage.getItem("ibrst_data") || "{}");
     me = JSON.parse(localStorage.getItem("ibrst_me") || "{}");
+    const sheetRaw = JSON.parse(localStorage.getItem("ibrst_sheet_state") || "null");
+    if (sheetRaw && typeof sheetRaw === "object") {
+      sheetState = {
+        url: sheetRaw.url || "",
+        connected: !!sheetRaw.connected,
+        connectedAt: sheetRaw.connectedAt || null
+      };
+    } else {
+      sheetState = { url: "", connected: false, connectedAt: null };
+    }
   } catch (e) {
     console.error('데이터 복원 실패:', e);
     students = [];
     dataMap = {};
     me = { role: null, cls: null };
+    sheetState = { url: "", connected: false, connectedAt: null };
   }
 }
 
@@ -290,6 +401,7 @@ function verifyLogin() {
 
 function requireAuth() {
   restore();
+  applySheetState();
   if (!me.role) {
     openLogin();
   } else {
@@ -367,8 +479,129 @@ async function registerStudent() {
     const el = q(sel);
     if (el) el.value = "";
   });
-  
+
   showMsg("regMsg", "학생이 등록되었습니다.");
+}
+
+function downloadStudentsList() {
+  if (me.role !== "admin" && me.role !== "class") {
+    openLogin();
+    return;
+  }
+
+  const list = students.filter(st => me.role === "admin" || st.cls === me.cls);
+  if (list.length === 0) {
+    showMsg("regMsg", "다운로드할 학생이 없습니다.", false);
+    return;
+  }
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    scope: me.role === "admin" ? "ALL" : me.cls,
+    students: list.map(st => ({
+      ...st,
+      records: (dataMap[st.id] || []).map(r => ({ ...r }))
+    }))
+  };
+
+  const filename = safeFileName(`ibrst-students-${payload.scope}.json`);
+  downloadJson(payload, filename);
+  showMsg("regMsg", "학생 정보를 다운로드했습니다.");
+}
+
+function handleStudentUpload(files) {
+  if (!files || files.length === 0) return;
+  if (me.role !== "admin" && me.role !== "class") {
+    openLogin();
+    return;
+  }
+
+  const file = files[0];
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const text = reader.result;
+      const payload = JSON.parse(text);
+      const rows = Array.isArray(payload)
+        ? payload
+        : (payload && Array.isArray(payload.students) ? payload.students : []);
+
+      if (rows.length === 0) {
+        showMsg("regMsg", "불러올 학생 데이터가 없습니다.", false);
+        return;
+      }
+
+      let imported = 0;
+      rows.forEach((raw, idx) => {
+        if (!raw) return;
+        const name = (raw.name || raw.studentName || "").trim();
+        const grade = ((raw.grade || raw.gradeLevel || "") + "").trim();
+        const incBehavior = (raw.incBehavior || raw.inc || raw.increase || "").toString().trim();
+        const decBehavior = (raw.decBehavior || raw.dec || raw.decrease || "").toString().trim();
+        if (!name || !grade || !incBehavior || !decBehavior) return;
+
+        let id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : "";
+        if (!id) id = "s" + (Date.now() + idx);
+
+        const cls = me.role === "admin"
+          ? (raw.cls || raw.class || raw.classroom || me.cls || "A")
+          : me.cls;
+        let start = Number(raw.interventionStart ?? raw.startSession ?? raw.intervention_start);
+        if (!Number.isFinite(start) || start < 1) start = 4;
+        start = Math.round(start);
+
+        const student = {
+          id,
+          name,
+          grade,
+          incBehavior,
+          decBehavior,
+          cls,
+          interventionStart: start
+        };
+
+        const existingIdx = students.findIndex(s => s.id === id);
+        if (existingIdx >= 0) students[existingIdx] = student;
+        else students.push(student);
+
+        if (!Array.isArray(dataMap[id])) dataMap[id] = [];
+        if (Array.isArray(raw.records)) {
+          const normalizedRecords = normalizeRecords(raw.records);
+          if (normalizedRecords.length > 0) {
+            dataMap[id] = normalizedRecords;
+            renumberSessions(id);
+          }
+        }
+
+        imported++;
+      });
+
+      if (imported === 0) {
+        showMsg("regMsg", "가져온 항목이 없습니다.", false);
+        return;
+      }
+
+      const currentSelection = q("#studentSelect")?.value || "";
+      persist();
+      populateStudentSelects();
+      const studentSelect = q("#studentSelect");
+      if (studentSelect) studentSelect.value = currentSelection;
+      const chartStudent = q("#chartStudent");
+      if (chartStudent) chartStudent.value = currentSelection;
+      if (currentSelection && dataMap[currentSelection]) {
+        renderTable(currentSelection);
+      }
+
+      showMsg("regMsg", `${imported}명의 학생 정보를 불러왔습니다.`);
+    } catch (e) {
+      console.error('학생 데이터 업로드 실패:', e);
+      showMsg("regMsg", "파일을 불러오지 못했습니다.", false);
+    }
+  };
+  reader.onerror = () => {
+    showMsg("regMsg", "파일을 불러오지 못했습니다.", false);
+  };
+  reader.readAsText(file);
 }
 
 // ====== 데이터 관련 함수들 ======
@@ -396,7 +629,9 @@ async function onPickStudent() {
       const res = await fetch(`${WEBAPP_URL}?action=getStudentData&studentId=${encodeURIComponent(id)}`);
       const payload = await res.json();
       if (Array.isArray(payload.records)) {
-        dataMap[id] = payload.records;
+        const normalized = normalizeRecords(payload.records);
+        dataMap[id] = mergeRecords(dataMap[id] || [], normalized);
+        renumberSessions(id);
         persist();
       }
     } catch (e) {
@@ -519,6 +754,154 @@ function renderTable(studentId) {
       </td>
     </tr>`;
   }).join("");
+}
+
+function downloadStudentRecords() {
+  const stId = q("#studentSelect")?.value;
+  if (!stId) {
+    showMsg("inputMsg", "학생을 선택하세요.", false);
+    return;
+  }
+  const st = getStudent(stId);
+  const records = (dataMap[stId] || []).map(r => ({ ...r }));
+  if (records.length === 0) {
+    showMsg("inputMsg", "다운로드할 데이터가 없습니다.", false);
+    return;
+  }
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    studentId: stId,
+    studentName: st.name,
+    class: st.cls,
+    grade: st.grade,
+    incBehavior: st.incBehavior,
+    decBehavior: st.decBehavior,
+    interventionStart: st.interventionStart,
+    records
+  };
+  const nameHint = st.name ? `${st.name}-${st.cls || ""}`.trim() : stId;
+  const filename = safeFileName(`ibrst-records-${nameHint || stId}.json`);
+  downloadJson(payload, filename);
+  showMsg("inputMsg", "데이터 파일을 다운로드했습니다.");
+}
+
+function mergeRecords(existing = [], incoming = []) {
+  const mapById = new Map();
+  existing.forEach(rec => {
+    if (rec && rec.id) {
+      mapById.set(rec.id, { ...rec });
+    }
+  });
+
+  const existingByDate = new Map();
+  existing.forEach(rec => {
+    if (!rec) return;
+    if (!existingByDate.has(rec.date)) {
+      existingByDate.set(rec.date, []);
+    }
+    existingByDate.get(rec.date).push(rec);
+  });
+
+  incoming.forEach(rec => {
+    if (!rec) return;
+    if (rec.id && mapById.has(rec.id)) {
+      const prev = mapById.get(rec.id);
+      const merged = { ...prev, ...rec, id: prev.id };
+      mapById.set(rec.id, merged);
+      existingByDate.set(merged.date, [...(existingByDate.get(merged.date) || []).filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    const sameDateList = existingByDate.get(rec.date) || [];
+    const matched = sameDateList.find(r => r.inc === rec.inc && r.dec === rec.dec && (r.memo || "") === (rec.memo || ""));
+    if (matched) {
+      const merged = { ...matched, ...rec, id: matched.id };
+      mapById.set(matched.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    if (sameDateList.length > 0) {
+      const fallback = sameDateList[0];
+      const merged = { ...fallback, ...rec, id: fallback.id };
+      mapById.set(fallback.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    mapById.set(rec.id, { ...rec });
+    existingByDate.set(rec.date, [...(existingByDate.get(rec.date) || []), { ...rec }]);
+  });
+
+  return Array.from(mapById.values());
+}
+
+function handleDataUpload(files) {
+  if (!files || files.length === 0) return;
+  const stId = q("#studentSelect")?.value;
+  if (!stId) {
+    showMsg("inputMsg", "학생을 선택한 뒤 업로드하세요.", false);
+    return;
+  }
+
+  const file = files[0];
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const text = reader.result;
+      const payload = JSON.parse(text);
+      let records = [];
+      if (Array.isArray(payload)) records = payload;
+      else if (payload && typeof payload === "object") {
+        if (Array.isArray(payload.records)) records = payload.records;
+        else if (Array.isArray(payload.data)) records = payload.data;
+      }
+
+      const normalized = normalizeRecords(records);
+      const existing = Array.isArray(dataMap[stId]) ? dataMap[stId] : [];
+      const merged = mergeRecords(existing, normalized);
+      dataMap[stId] = merged;
+      renumberSessions(stId);
+
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+        const st = getStudent(stId);
+        if (st) {
+          if (payload.studentName) st.name = payload.studentName;
+          if (payload.grade) st.grade = payload.grade;
+          if (payload.incBehavior) st.incBehavior = payload.incBehavior;
+          if (payload.decBehavior) st.decBehavior = payload.decBehavior;
+          const startRaw = Number(payload.interventionStart ?? payload.startSession);
+          if (Number.isFinite(startRaw) && startRaw > 0) {
+            st.interventionStart = Math.round(startRaw);
+            const interventionInput = q("#interventionStart");
+            if (interventionInput) interventionInput.value = st.interventionStart;
+          }
+        }
+      }
+
+      persist();
+      populateStudentSelects();
+      const studentSelect = q("#studentSelect");
+      if (studentSelect) studentSelect.value = stId;
+      const chartStudent = q("#chartStudent");
+      if (chartStudent && chartStudent.value === stId) {
+        // chart selection remains; no auto redraw to avoid unexpected canvas update
+      }
+      renderTable(stId);
+      if (normalized.length > 0) {
+        showMsg("inputMsg", `${normalized.length}건의 데이터를 불러왔습니다.`);
+      } else {
+        showMsg("inputMsg", "업로드된 데이터가 없습니다.", false);
+      }
+    } catch (e) {
+      console.error('데이터 업로드 실패:', e);
+      showMsg("inputMsg", "파일을 읽을 수 없습니다.", false);
+    }
+  };
+  reader.onerror = () => {
+    showMsg("inputMsg", "파일을 읽을 수 없습니다.", false);
+  };
+  reader.readAsText(file);
 }
 
 async function saveRow(studentId, recId) {
@@ -843,35 +1226,135 @@ function renderAnalysis(st, base, inter) {
 }
 
 // ====== 관리자 관련 함수들 ======
-async function saveSheetUrl() {
+async function connectSheet() {
   const url = q("#sheetUrl")?.value?.trim();
   if (!url) {
-    alert("Sheet URL을 입력하세요.");
+    showMsg("sheetMsg", "구글 시트 링크를 입력하세요.", false);
     return;
   }
+
+  if (!/^https:\/\/docs\.google\.com\/spreadsheets\//.test(url)) {
+    showMsg("sheetMsg", "구글 시트 공유 링크를 입력해주세요.", false);
+    return;
+  }
+
   if (!WEBAPP_URL) {
     alert("WEBAPP_URL을 HTML 상단에 설정하세요.");
     return;
   }
 
   try {
-    await fetch(WEBAPP_URL, {
+    const res = await fetch(WEBAPP_URL, {
       method: "POST",
       body: JSON.stringify({
         action: "setSheetUrl",
         sheetUrl: url
       })
     });
-    localStorage.setItem("ibrst_sheet_url_cache", url);
-    showMsg("analysis", "시트 URL이 저장되었습니다.");
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    sheetState = {
+      url,
+      connected: true,
+      connectedAt: new Date().toISOString()
+    };
+
+    persist();
+    applySheetState();
+    showMsg("sheetMsg", "구글 시트와 연결되었습니다.");
   } catch (e) {
-    alert("저장 실패: " + e);
+    showMsg("sheetMsg", `연결 실패: ${e.message || e}`, false);
+  }
+}
+
+async function disconnectSheet() {
+  if (!sheetState.connected && !sheetState.url) {
+    showMsg("sheetMsg", "현재 연결된 구글 시트가 없습니다.", false);
+    return;
+  }
+
+  if (WEBAPP_URL) {
+    try {
+      const res = await fetch(WEBAPP_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "clearSheetUrl" })
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+    } catch (e) {
+      console.warn('시트 연결 해제 요청 실패:', e);
+    }
+  }
+
+  sheetState = { url: "", connected: false, connectedAt: null };
+  persist();
+  applySheetState();
+  showMsg("sheetMsg", "구글 시트 연결이 해제되었습니다.");
+}
+
+function downloadSheetTemplate() {
+  const headers = [
+    "student_id",
+    "student_name",
+    "class",
+    "grade",
+    "intervention_start",
+    "date",
+    "inc",
+    "dec",
+    "memo"
+  ];
+  const csv = headers.join(",") + "\n";
+  downloadText(csv, "ibrst-google-sheet-header.csv", "text/csv");
+  showMsg("sheetMsg", "헤더 양식을 다운로드했습니다.");
+}
+
+function applySheetState() {
+  const input = q("#sheetUrl");
+  if (input) {
+    input.value = sheetState.url || "";
+  }
+
+  const status = q("#sheetStatus");
+  if (status) {
+    if (sheetState.connected && sheetState.url) {
+      let hostText = "docs.google.com";
+      try {
+        const parsed = new URL(sheetState.url);
+        hostText = parsed.hostname;
+      } catch (e) {
+        /* ignore */
+      }
+      const connectedAt = sheetState.connectedAt ? new Date(sheetState.connectedAt).toLocaleString() : "";
+      status.innerHTML = `<span class="kicker">연결됨</span><span class="muted">${hostText}${connectedAt ? ` · ${connectedAt}` : ""}</span>`;
+    } else {
+      status.innerHTML = '<span class="muted">연결되지 않음</span>';
+    }
+  }
+
+  const disconnectBtn = q("#disconnectSheet");
+  if (disconnectBtn) {
+    disconnectBtn.disabled = !sheetState.connected;
+  }
+
+  const pullAllBtn = q("#pullAll");
+  if (pullAllBtn) {
+    pullAllBtn.disabled = !sheetState.connected;
   }
 }
 
 async function syncFromServer() {
   if (!WEBAPP_URL) {
     alert("WEBAPP_URL을 HTML 상단에 설정하세요.");
+    return;
+  }
+
+  if (!sheetState.connected || !sheetState.url) {
+    showMsg("sheetMsg", "먼저 구글 시트와 연결하세요.", false);
     return;
   }
 
@@ -948,12 +1431,42 @@ function bindEvents() {
   const studentSelect = q("#studentSelect");
   if (studentSelect) studentSelect.addEventListener("change", onPickStudent);
 
+  const downloadRecordsBtn = q("#downloadRecords");
+  if (downloadRecordsBtn) downloadRecordsBtn.addEventListener("click", downloadStudentRecords);
+
+  const uploadRecordsBtn = q("#uploadRecordsBtn");
+  const uploadRecordsInput = q("#uploadRecordsInput");
+  if (uploadRecordsBtn && uploadRecordsInput) {
+    uploadRecordsBtn.addEventListener("click", () => uploadRecordsInput.click());
+  }
+  if (uploadRecordsInput) {
+    uploadRecordsInput.addEventListener("change", (e) => {
+      handleDataUpload(e.target.files);
+      e.target.value = "";
+    });
+  }
+
   const saveInterventionBtn = q("#saveInterventionStart");
   if (saveInterventionBtn) saveInterventionBtn.addEventListener("click", saveInterventionStart);
 
   // 학생 등록 관련
   const regBtn = q("#regBtn");
   if (regBtn) regBtn.addEventListener("click", registerStudent);
+
+  const downloadStudentsBtn = q("#downloadStudents");
+  if (downloadStudentsBtn) downloadStudentsBtn.addEventListener("click", downloadStudentsList);
+
+  const uploadStudentsBtn = q("#uploadStudentsBtn");
+  const uploadStudentsInput = q("#uploadStudentsInput");
+  if (uploadStudentsBtn && uploadStudentsInput) {
+    uploadStudentsBtn.addEventListener("click", () => uploadStudentsInput.click());
+  }
+  if (uploadStudentsInput) {
+    uploadStudentsInput.addEventListener("change", (e) => {
+      handleStudentUpload(e.target.files);
+      e.target.value = "";
+    });
+  }
 
   const resetLocalBtn = q("#resetLocal");
   if (resetLocalBtn) {
@@ -970,8 +1483,14 @@ function bindEvents() {
   if (drawBtn) drawBtn.addEventListener("click", drawChart);
 
   // 관리자 관련
-  const saveUrlBtn = q("#saveUrl");
-  if (saveUrlBtn) saveUrlBtn.addEventListener("click", saveSheetUrl);
+  const connectSheetBtn = q("#connectSheet");
+  if (connectSheetBtn) connectSheetBtn.addEventListener("click", connectSheet);
+
+  const disconnectSheetBtn = q("#disconnectSheet");
+  if (disconnectSheetBtn) disconnectSheetBtn.addEventListener("click", disconnectSheet);
+
+  const downloadSheetTemplateBtn = q("#downloadSheetTemplate");
+  if (downloadSheetTemplateBtn) downloadSheetTemplateBtn.addEventListener("click", downloadSheetTemplate);
 
   const pullAllBtn = q("#pullAll");
   if (pullAllBtn) pullAllBtn.addEventListener("click", syncFromServer);
@@ -991,7 +1510,6 @@ function initApp() {
   bindEvents();
 
   // 데이터 복원 및 인증 확인
-  restore();
   requireAuth();
 }
 
