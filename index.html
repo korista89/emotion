@@ -205,7 +205,7 @@ const WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxCHjjR08I0sH_N0PiHp
 let students = [];
 let dataMap = {};
 let me = { role: null, cls: null };
-let sheetState = { url: "", connected: false, connectedAt: null };
+let sheetState = { url: "", sheetId: "", connected: false, connectedAt: null };
 
 // ====== 유틸리티 함수들 ======
 function q(sel) { return document.querySelector(sel); }
@@ -250,6 +250,22 @@ function downloadText(content, filename, mime = "text/plain") {
     }, 0);
   } catch (e) {
     console.error('텍스트 다운로드 실패:', e);
+  }
+}
+
+function extractSheetInfo(rawUrl = "") {
+  try {
+    const url = new URL(rawUrl);
+    if (!/\.google\.com$/.test(url.hostname)) return null;
+    const match = url.pathname.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!match) return null;
+    const sheetId = match[1];
+    const gidMatch = url.hash.match(/gid=(\d+)/) || url.search.match(/gid=(\d+)/);
+    const gid = gidMatch ? gidMatch[1] : "0";
+    const normalized = `https://docs.google.com/spreadsheets/d/${sheetId}/edit#gid=${gid}`;
+    return { sheetId, gid, normalizedUrl: normalized };
+  } catch (e) {
+    return null;
   }
 }
 
@@ -330,18 +346,19 @@ function restore() {
     if (sheetRaw && typeof sheetRaw === "object") {
       sheetState = {
         url: sheetRaw.url || "",
+        sheetId: sheetRaw.sheetId || "",
         connected: !!sheetRaw.connected,
         connectedAt: sheetRaw.connectedAt || null
       };
     } else {
-      sheetState = { url: "", connected: false, connectedAt: null };
+      sheetState = { url: "", sheetId: "", connected: false, connectedAt: null };
     }
   } catch (e) {
     console.error('데이터 복원 실패:', e);
     students = [];
     dataMap = {};
     me = { role: null, cls: null };
-    sheetState = { url: "", connected: false, connectedAt: null };
+    sheetState = { url: "", sheetId: "", connected: false, connectedAt: null };
   }
 }
 
@@ -1227,13 +1244,15 @@ function renderAnalysis(st, base, inter) {
 
 // ====== 관리자 관련 함수들 ======
 async function connectSheet() {
-  const url = q("#sheetUrl")?.value?.trim();
-  if (!url) {
+  const urlInput = q("#sheetUrl");
+  const rawUrl = urlInput?.value?.trim();
+  if (!rawUrl) {
     showMsg("sheetMsg", "구글 시트 링크를 입력하세요.", false);
     return;
   }
 
-  if (!/^https:\/\/docs\.google\.com\/spreadsheets\//.test(url)) {
+  const parsed = extractSheetInfo(rawUrl);
+  if (!parsed) {
     showMsg("sheetMsg", "구글 시트 공유 링크를 입력해주세요.", false);
     return;
   }
@@ -1243,12 +1262,20 @@ async function connectSheet() {
     return;
   }
 
+  const connectBtn = q("#connectSheet");
+  if (connectBtn) {
+    connectBtn.disabled = true;
+    connectBtn.dataset.originalText = connectBtn.dataset.originalText || connectBtn.textContent;
+    connectBtn.textContent = "연결 중...";
+  }
+
   try {
     const res = await fetch(WEBAPP_URL, {
       method: "POST",
       body: JSON.stringify({
         action: "setSheetUrl",
-        sheetUrl: url
+        sheetUrl: parsed.normalizedUrl,
+        sheetId: parsed.sheetId
       })
     });
 
@@ -1256,8 +1283,14 @@ async function connectSheet() {
       throw new Error(`HTTP ${res.status}`);
     }
 
+    const payload = await res.json().catch(() => null);
+    if (payload && payload.success === false) {
+      throw new Error(payload.message || "서버에서 연결을 거부했습니다.");
+    }
+
     sheetState = {
-      url,
+      url: parsed.normalizedUrl,
+      sheetId: parsed.sheetId,
       connected: true,
       connectedAt: new Date().toISOString()
     };
@@ -1267,6 +1300,12 @@ async function connectSheet() {
     showMsg("sheetMsg", "구글 시트와 연결되었습니다.");
   } catch (e) {
     showMsg("sheetMsg", `연결 실패: ${e.message || e}`, false);
+  }
+  finally {
+    if (connectBtn) {
+      connectBtn.disabled = false;
+      connectBtn.textContent = connectBtn.dataset.originalText || "연결";
+    }
   }
 }
 
@@ -1280,7 +1319,10 @@ async function disconnectSheet() {
     try {
       const res = await fetch(WEBAPP_URL, {
         method: "POST",
-        body: JSON.stringify({ action: "clearSheetUrl" })
+        body: JSON.stringify({
+          action: "clearSheetUrl",
+          sheetId: sheetState.sheetId || undefined
+        })
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -1290,7 +1332,7 @@ async function disconnectSheet() {
     }
   }
 
-  sheetState = { url: "", connected: false, connectedAt: null };
+  sheetState = { url: "", sheetId: "", connected: false, connectedAt: null };
   persist();
   applySheetState();
   showMsg("sheetMsg", "구글 시트 연결이 해제되었습니다.");
@@ -1330,7 +1372,9 @@ function applySheetState() {
         /* ignore */
       }
       const connectedAt = sheetState.connectedAt ? new Date(sheetState.connectedAt).toLocaleString() : "";
-      status.innerHTML = `<span class="kicker">연결됨</span><span class="muted">${hostText}${connectedAt ? ` · ${connectedAt}` : ""}</span>`;
+      const sheetLabel = sheetState.sheetId ? ` · ${sheetState.sheetId}` : "";
+      const openLink = `<a href="${sheetState.url}" target="_blank" rel="noopener" class="btn-ghost btn-small" style="text-decoration:none;margin-left:8px">열기</a>`;
+      status.innerHTML = `<span class="kicker">연결됨</span><span class="muted">${hostText}${sheetLabel}${connectedAt ? ` · ${connectedAt}` : ""}</span>${openLink}`;
     } else {
       status.innerHTML = '<span class="muted">연결되지 않음</span>';
     }
@@ -1339,6 +1383,11 @@ function applySheetState() {
   const disconnectBtn = q("#disconnectSheet");
   if (disconnectBtn) {
     disconnectBtn.disabled = !sheetState.connected;
+  }
+
+  const connectBtn = q("#connectSheet");
+  if (connectBtn) {
+    connectBtn.disabled = false;
   }
 
   const pullAllBtn = q("#pullAll");
@@ -1359,7 +1408,12 @@ async function syncFromServer() {
   }
 
   try {
-    const res = await fetch(`${WEBAPP_URL}?action=getAll`);
+    const url = new URL(WEBAPP_URL);
+    url.searchParams.set("action", "getAll");
+    if (sheetState.sheetId) {
+      url.searchParams.set("sheetId", sheetState.sheetId);
+    }
+    const res = await fetch(url.toString());
     const payload = await res.json();
 
     if (payload && Array.isArray(payload.students)) {
