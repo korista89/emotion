@@ -593,7 +593,9 @@ async function onPickStudent() {
       const res = await fetch(`${WEBAPP_URL}?action=getStudentData&studentId=${encodeURIComponent(id)}`);
       const payload = await res.json();
       if (Array.isArray(payload.records)) {
-        dataMap[id] = payload.records;
+        const normalized = normalizeRecords(payload.records);
+        dataMap[id] = mergeRecords(dataMap[id] || [], normalized);
+        renumberSessions(id);
         persist();
       }
     } catch (e) {
@@ -726,6 +728,10 @@ function downloadStudentRecords() {
   }
   const st = getStudent(stId);
   const records = (dataMap[stId] || []).map(r => ({ ...r }));
+  if (records.length === 0) {
+    showMsg("inputMsg", "다운로드할 데이터가 없습니다.", false);
+    return;
+  }
   const payload = {
     exportedAt: new Date().toISOString(),
     studentId: stId,
@@ -741,6 +747,57 @@ function downloadStudentRecords() {
   const filename = safeFileName(`ibrst-records-${nameHint || stId}.json`);
   downloadJson(payload, filename);
   showMsg("inputMsg", "데이터 파일을 다운로드했습니다.");
+}
+
+function mergeRecords(existing = [], incoming = []) {
+  const mapById = new Map();
+  existing.forEach(rec => {
+    if (rec && rec.id) {
+      mapById.set(rec.id, { ...rec });
+    }
+  });
+
+  const existingByDate = new Map();
+  existing.forEach(rec => {
+    if (!rec) return;
+    if (!existingByDate.has(rec.date)) {
+      existingByDate.set(rec.date, []);
+    }
+    existingByDate.get(rec.date).push(rec);
+  });
+
+  incoming.forEach(rec => {
+    if (!rec) return;
+    if (rec.id && mapById.has(rec.id)) {
+      const prev = mapById.get(rec.id);
+      const merged = { ...prev, ...rec, id: prev.id };
+      mapById.set(rec.id, merged);
+      existingByDate.set(merged.date, [...(existingByDate.get(merged.date) || []).filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    const sameDateList = existingByDate.get(rec.date) || [];
+    const matched = sameDateList.find(r => r.inc === rec.inc && r.dec === rec.dec && (r.memo || "") === (rec.memo || ""));
+    if (matched) {
+      const merged = { ...matched, ...rec, id: matched.id };
+      mapById.set(matched.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    if (sameDateList.length > 0) {
+      const fallback = sameDateList[0];
+      const merged = { ...fallback, ...rec, id: fallback.id };
+      mapById.set(fallback.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    mapById.set(rec.id, { ...rec });
+    existingByDate.set(rec.date, [...(existingByDate.get(rec.date) || []), { ...rec }]);
+  });
+
+  return Array.from(mapById.values());
 }
 
 function handleDataUpload(files) {
@@ -765,7 +822,9 @@ function handleDataUpload(files) {
       }
 
       const normalized = normalizeRecords(records);
-      dataMap[stId] = normalized;
+      const existing = Array.isArray(dataMap[stId]) ? dataMap[stId] : [];
+      const merged = mergeRecords(existing, normalized);
+      dataMap[stId] = merged;
       renumberSessions(stId);
 
       if (payload && typeof payload === "object" && !Array.isArray(payload)) {
