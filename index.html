@@ -94,6 +94,9 @@
         <div class="toolbar" style="margin-top:10px">
           <button class="btn" id="saveBtn">데이터 저장</button>
           <button class="btn-muted" id="clearBtn">입력 초기화</button>
+          <button class="btn-ghost" id="downloadRecords">데이터 다운로드</button>
+          <button class="btn-muted" id="uploadRecordsBtn">데이터 업로드</button>
+          <input type="file" id="uploadRecordsInput" accept="application/json" style="display:none">
           <span class="pill">
             <span>중재 시작 회기</span>
             <input id="interventionStart" type="number" min="1" value="4" style="width:80px;padding:6px 10px">
@@ -141,6 +144,9 @@
         <div class="toolbar" style="margin-top:10px">
           <button class="btn" id="regBtn">학생 등록</button>
           <button class="btn-muted" id="resetLocal">로컬 데이터 초기화</button>
+          <button class="btn-ghost" id="downloadStudents">학생 다운로드</button>
+          <button class="btn-muted" id="uploadStudentsBtn">학생 업로드</button>
+          <input type="file" id="uploadStudentsInput" accept="application/json" style="display:none">
         </div>
         <div id="regMsg" class="msg hidden"></div>
       </section>
@@ -201,6 +207,76 @@ function q(sel) { return document.querySelector(sel); }
 function qa(sel) { return Array.from(document.querySelectorAll(sel)); }
 function today() { return new Date().toISOString().split("T")[0]; }
 function uuid() { return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+function safeFileName(name) {
+  return (name || "export").replace(/[\\/:*?"<>|]+/g, "_");
+}
+
+function downloadJson(data, filename) {
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 0);
+  } catch (e) {
+    console.error('다운로드 생성 실패:', e);
+  }
+}
+
+function normalizeDate(value) {
+  if (value === null || typeof value === "undefined") return "";
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const base = new Date(Date.UTC(1899, 11, 30));
+    const excelDate = new Date(base.getTime() + Math.round(value) * 86400000);
+    if (!isNaN(excelDate)) {
+      return excelDate.toISOString().split("T")[0];
+    }
+  }
+  const str = String(value).trim();
+  if (!str) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+  const normalized = str.replace(/[.]/g, "-").replace(/\//g, "-");
+  const date = new Date(normalized);
+  if (!isNaN(date)) {
+    return date.toISOString().split("T")[0];
+  }
+  return "";
+}
+
+function parseScore(value) {
+  if (value === null || typeof value === "undefined" || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.round(num);
+  return Math.max(0, Math.min(5, rounded));
+}
+
+function normalizeRecords(records = []) {
+  const sanitized = [];
+  records.forEach((raw, idx) => {
+    if (!raw) return;
+    const date = normalizeDate(raw.date ?? raw.sessionDate ?? raw.day ?? raw.recordedAt);
+    const inc = parseScore(raw.inc ?? raw.incScore ?? raw.increase ?? raw.incBehavior ?? raw.inc_value);
+    const dec = parseScore(raw.dec ?? raw.decScore ?? raw.decrease ?? raw.decBehavior ?? raw.dec_value);
+    if (!date || inc === null || dec === null) return;
+    const memoSource = raw.memo ?? raw.note ?? raw.notes ?? raw.comment ?? "";
+    const memo = memoSource === null || typeof memoSource === "undefined" ? "" : String(memoSource);
+    let timestamp = Number(raw.timestamp);
+    if (!Number.isFinite(timestamp)) timestamp = Date.now() + idx;
+    let id = typeof raw.id === "string" && raw.id ? raw.id : "";
+    if (!id) id = uuid();
+    sanitized.push({ id, date, inc, dec, memo, timestamp });
+  });
+  sanitized.sort((a, b) => a.date.localeCompare(b.date) || a.timestamp - b.timestamp);
+  return sanitized;
+}
 
 function showMsg(elId, text, ok = true) {
   const el = typeof elId === 'string' ? document.getElementById(elId) : elId;
@@ -367,8 +443,129 @@ async function registerStudent() {
     const el = q(sel);
     if (el) el.value = "";
   });
-  
+
   showMsg("regMsg", "학생이 등록되었습니다.");
+}
+
+function downloadStudentsList() {
+  if (me.role !== "admin" && me.role !== "class") {
+    openLogin();
+    return;
+  }
+
+  const list = students.filter(st => me.role === "admin" || st.cls === me.cls);
+  if (list.length === 0) {
+    showMsg("regMsg", "다운로드할 학생이 없습니다.", false);
+    return;
+  }
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    scope: me.role === "admin" ? "ALL" : me.cls,
+    students: list.map(st => ({
+      ...st,
+      records: (dataMap[st.id] || []).map(r => ({ ...r }))
+    }))
+  };
+
+  const filename = safeFileName(`ibrst-students-${payload.scope}.json`);
+  downloadJson(payload, filename);
+  showMsg("regMsg", "학생 정보를 다운로드했습니다.");
+}
+
+function handleStudentUpload(files) {
+  if (!files || files.length === 0) return;
+  if (me.role !== "admin" && me.role !== "class") {
+    openLogin();
+    return;
+  }
+
+  const file = files[0];
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const text = reader.result;
+      const payload = JSON.parse(text);
+      const rows = Array.isArray(payload)
+        ? payload
+        : (payload && Array.isArray(payload.students) ? payload.students : []);
+
+      if (rows.length === 0) {
+        showMsg("regMsg", "불러올 학생 데이터가 없습니다.", false);
+        return;
+      }
+
+      let imported = 0;
+      rows.forEach((raw, idx) => {
+        if (!raw) return;
+        const name = (raw.name || raw.studentName || "").trim();
+        const grade = ((raw.grade || raw.gradeLevel || "") + "").trim();
+        const incBehavior = (raw.incBehavior || raw.inc || raw.increase || "").toString().trim();
+        const decBehavior = (raw.decBehavior || raw.dec || raw.decrease || "").toString().trim();
+        if (!name || !grade || !incBehavior || !decBehavior) return;
+
+        let id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : "";
+        if (!id) id = "s" + (Date.now() + idx);
+
+        const cls = me.role === "admin"
+          ? (raw.cls || raw.class || raw.classroom || me.cls || "A")
+          : me.cls;
+        let start = Number(raw.interventionStart ?? raw.startSession ?? raw.intervention_start);
+        if (!Number.isFinite(start) || start < 1) start = 4;
+        start = Math.round(start);
+
+        const student = {
+          id,
+          name,
+          grade,
+          incBehavior,
+          decBehavior,
+          cls,
+          interventionStart: start
+        };
+
+        const existingIdx = students.findIndex(s => s.id === id);
+        if (existingIdx >= 0) students[existingIdx] = student;
+        else students.push(student);
+
+        if (!Array.isArray(dataMap[id])) dataMap[id] = [];
+        if (Array.isArray(raw.records)) {
+          const normalizedRecords = normalizeRecords(raw.records);
+          if (normalizedRecords.length > 0) {
+            dataMap[id] = normalizedRecords;
+            renumberSessions(id);
+          }
+        }
+
+        imported++;
+      });
+
+      if (imported === 0) {
+        showMsg("regMsg", "가져온 항목이 없습니다.", false);
+        return;
+      }
+
+      const currentSelection = q("#studentSelect")?.value || "";
+      persist();
+      populateStudentSelects();
+      const studentSelect = q("#studentSelect");
+      if (studentSelect) studentSelect.value = currentSelection;
+      const chartStudent = q("#chartStudent");
+      if (chartStudent) chartStudent.value = currentSelection;
+      if (currentSelection && dataMap[currentSelection]) {
+        renderTable(currentSelection);
+      }
+
+      showMsg("regMsg", `${imported}명의 학생 정보를 불러왔습니다.`);
+    } catch (e) {
+      console.error('학생 데이터 업로드 실패:', e);
+      showMsg("regMsg", "파일을 불러오지 못했습니다.", false);
+    }
+  };
+  reader.onerror = () => {
+    showMsg("regMsg", "파일을 불러오지 못했습니다.", false);
+  };
+  reader.readAsText(file);
 }
 
 // ====== 데이터 관련 함수들 ======
@@ -396,7 +593,9 @@ async function onPickStudent() {
       const res = await fetch(`${WEBAPP_URL}?action=getStudentData&studentId=${encodeURIComponent(id)}`);
       const payload = await res.json();
       if (Array.isArray(payload.records)) {
-        dataMap[id] = payload.records;
+        const normalized = normalizeRecords(payload.records);
+        dataMap[id] = mergeRecords(dataMap[id] || [], normalized);
+        renumberSessions(id);
         persist();
       }
     } catch (e) {
@@ -519,6 +718,154 @@ function renderTable(studentId) {
       </td>
     </tr>`;
   }).join("");
+}
+
+function downloadStudentRecords() {
+  const stId = q("#studentSelect")?.value;
+  if (!stId) {
+    showMsg("inputMsg", "학생을 선택하세요.", false);
+    return;
+  }
+  const st = getStudent(stId);
+  const records = (dataMap[stId] || []).map(r => ({ ...r }));
+  if (records.length === 0) {
+    showMsg("inputMsg", "다운로드할 데이터가 없습니다.", false);
+    return;
+  }
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    studentId: stId,
+    studentName: st.name,
+    class: st.cls,
+    grade: st.grade,
+    incBehavior: st.incBehavior,
+    decBehavior: st.decBehavior,
+    interventionStart: st.interventionStart,
+    records
+  };
+  const nameHint = st.name ? `${st.name}-${st.cls || ""}`.trim() : stId;
+  const filename = safeFileName(`ibrst-records-${nameHint || stId}.json`);
+  downloadJson(payload, filename);
+  showMsg("inputMsg", "데이터 파일을 다운로드했습니다.");
+}
+
+function mergeRecords(existing = [], incoming = []) {
+  const mapById = new Map();
+  existing.forEach(rec => {
+    if (rec && rec.id) {
+      mapById.set(rec.id, { ...rec });
+    }
+  });
+
+  const existingByDate = new Map();
+  existing.forEach(rec => {
+    if (!rec) return;
+    if (!existingByDate.has(rec.date)) {
+      existingByDate.set(rec.date, []);
+    }
+    existingByDate.get(rec.date).push(rec);
+  });
+
+  incoming.forEach(rec => {
+    if (!rec) return;
+    if (rec.id && mapById.has(rec.id)) {
+      const prev = mapById.get(rec.id);
+      const merged = { ...prev, ...rec, id: prev.id };
+      mapById.set(rec.id, merged);
+      existingByDate.set(merged.date, [...(existingByDate.get(merged.date) || []).filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    const sameDateList = existingByDate.get(rec.date) || [];
+    const matched = sameDateList.find(r => r.inc === rec.inc && r.dec === rec.dec && (r.memo || "") === (rec.memo || ""));
+    if (matched) {
+      const merged = { ...matched, ...rec, id: matched.id };
+      mapById.set(matched.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    if (sameDateList.length > 0) {
+      const fallback = sameDateList[0];
+      const merged = { ...fallback, ...rec, id: fallback.id };
+      mapById.set(fallback.id, merged);
+      existingByDate.set(merged.date, [...sameDateList.filter(r => r.id !== merged.id), merged]);
+      return;
+    }
+
+    mapById.set(rec.id, { ...rec });
+    existingByDate.set(rec.date, [...(existingByDate.get(rec.date) || []), { ...rec }]);
+  });
+
+  return Array.from(mapById.values());
+}
+
+function handleDataUpload(files) {
+  if (!files || files.length === 0) return;
+  const stId = q("#studentSelect")?.value;
+  if (!stId) {
+    showMsg("inputMsg", "학생을 선택한 뒤 업로드하세요.", false);
+    return;
+  }
+
+  const file = files[0];
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const text = reader.result;
+      const payload = JSON.parse(text);
+      let records = [];
+      if (Array.isArray(payload)) records = payload;
+      else if (payload && typeof payload === "object") {
+        if (Array.isArray(payload.records)) records = payload.records;
+        else if (Array.isArray(payload.data)) records = payload.data;
+      }
+
+      const normalized = normalizeRecords(records);
+      const existing = Array.isArray(dataMap[stId]) ? dataMap[stId] : [];
+      const merged = mergeRecords(existing, normalized);
+      dataMap[stId] = merged;
+      renumberSessions(stId);
+
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+        const st = getStudent(stId);
+        if (st) {
+          if (payload.studentName) st.name = payload.studentName;
+          if (payload.grade) st.grade = payload.grade;
+          if (payload.incBehavior) st.incBehavior = payload.incBehavior;
+          if (payload.decBehavior) st.decBehavior = payload.decBehavior;
+          const startRaw = Number(payload.interventionStart ?? payload.startSession);
+          if (Number.isFinite(startRaw) && startRaw > 0) {
+            st.interventionStart = Math.round(startRaw);
+            const interventionInput = q("#interventionStart");
+            if (interventionInput) interventionInput.value = st.interventionStart;
+          }
+        }
+      }
+
+      persist();
+      populateStudentSelects();
+      const studentSelect = q("#studentSelect");
+      if (studentSelect) studentSelect.value = stId;
+      const chartStudent = q("#chartStudent");
+      if (chartStudent && chartStudent.value === stId) {
+        // chart selection remains; no auto redraw to avoid unexpected canvas update
+      }
+      renderTable(stId);
+      if (normalized.length > 0) {
+        showMsg("inputMsg", `${normalized.length}건의 데이터를 불러왔습니다.`);
+      } else {
+        showMsg("inputMsg", "업로드된 데이터가 없습니다.", false);
+      }
+    } catch (e) {
+      console.error('데이터 업로드 실패:', e);
+      showMsg("inputMsg", "파일을 읽을 수 없습니다.", false);
+    }
+  };
+  reader.onerror = () => {
+    showMsg("inputMsg", "파일을 읽을 수 없습니다.", false);
+  };
+  reader.readAsText(file);
 }
 
 async function saveRow(studentId, recId) {
@@ -948,12 +1295,42 @@ function bindEvents() {
   const studentSelect = q("#studentSelect");
   if (studentSelect) studentSelect.addEventListener("change", onPickStudent);
 
+  const downloadRecordsBtn = q("#downloadRecords");
+  if (downloadRecordsBtn) downloadRecordsBtn.addEventListener("click", downloadStudentRecords);
+
+  const uploadRecordsBtn = q("#uploadRecordsBtn");
+  const uploadRecordsInput = q("#uploadRecordsInput");
+  if (uploadRecordsBtn && uploadRecordsInput) {
+    uploadRecordsBtn.addEventListener("click", () => uploadRecordsInput.click());
+  }
+  if (uploadRecordsInput) {
+    uploadRecordsInput.addEventListener("change", (e) => {
+      handleDataUpload(e.target.files);
+      e.target.value = "";
+    });
+  }
+
   const saveInterventionBtn = q("#saveInterventionStart");
   if (saveInterventionBtn) saveInterventionBtn.addEventListener("click", saveInterventionStart);
 
   // 학생 등록 관련
   const regBtn = q("#regBtn");
   if (regBtn) regBtn.addEventListener("click", registerStudent);
+
+  const downloadStudentsBtn = q("#downloadStudents");
+  if (downloadStudentsBtn) downloadStudentsBtn.addEventListener("click", downloadStudentsList);
+
+  const uploadStudentsBtn = q("#uploadStudentsBtn");
+  const uploadStudentsInput = q("#uploadStudentsInput");
+  if (uploadStudentsBtn && uploadStudentsInput) {
+    uploadStudentsBtn.addEventListener("click", () => uploadStudentsInput.click());
+  }
+  if (uploadStudentsInput) {
+    uploadStudentsInput.addEventListener("change", (e) => {
+      handleStudentUpload(e.target.files);
+      e.target.value = "";
+    });
+  }
 
   const resetLocalBtn = q("#resetLocal");
   if (resetLocalBtn) {
